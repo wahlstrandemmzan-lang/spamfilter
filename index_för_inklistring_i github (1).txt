@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AI Filmomdöme-klassificerare</title>
+  <style>
+    :root { --bg:#6b6fd6; --card:#ffffff; --muted:#6b7280; --danger:#b91c1c; --danger-bg:#fee2e2;
+             --ok:#065f46; --ok-bg:#d1fae5; --border:#e5e7eb; --btn:#111827; --btn2:#374151; }
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial;background:var(--bg);
+         min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
+    .card{width:min(900px,100%);background:var(--card);border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.25);padding:28px;}
+    h1{margin:0 0 6px 0;font-size:28px;display:flex;gap:10px;align-items:center;}
+    .sub{margin:0 0 18px 0;color:var(--muted);font-size:14px;}
+    .alert{display:none;border-radius:12px;padding:12px 14px;margin:10px 0 16px 0;border:1px solid rgba(0,0,0,.05);font-size:14px;white-space:pre-wrap;}
+    .alert.danger{background:var(--danger-bg);color:var(--danger);}
+    .alert.ok{background:var(--ok-bg);color:var(--ok);}
+    label{font-weight:900;display:block;margin:12px 0 8px;}
+    textarea{width:100%;min-height:120px;resize:vertical;border:1px solid var(--border);border-radius:12px;padding:12px;font-size:15px;outline:none;}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px;}
+    button{border:0;border-radius:12px;padding:12px 14px;font-weight:900;cursor:pointer;color:#fff;background:var(--btn);}
+    button.secondary{background:var(--btn2);}
+    .result{margin-top:14px;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:#f9fafb;display:none;}
+    details{margin-top:14px;border:1px solid var(--border);border-radius:12px;background:#f9fafb;padding:10px 12px;}
+    summary{cursor:pointer;font-weight:900;}
+    pre{margin:10px 0 0 0;font-size:12px;line-height:1.35;background:#111827;color:#e5e7eb;padding:12px;border-radius:12px;overflow:auto;max-height:260px;}
+    .tiny{color:var(--muted);font-size:12px;}
+    code.small{font-size:12px;background:#f3f4f6;padding:2px 6px;border-radius:8px;}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+</head>
+<body>
+  <div class="card">
+    <h1>🎬 AI Filmomdöme-klassificerare</h1>
+    <p class="sub">Skriv ett omdöme och låt AI:n avgöra om det är positivt, negativt eller neutralt.</p>
+
+    <div id="alert" class="alert danger"></div>
+    <div id="ok" class="alert ok"></div>
+
+    <label for="text">Ditt filmomdöme:</label>
+    <textarea id="text" placeholder="Skriv t.ex. 'Fantastisk film, jag älskade den'"></textarea>
+
+    <div class="row">
+      <button onclick="analyze()">Analysera känsla</button>
+      <button class="secondary" onclick="reloadModel()">Ladda om modellen</button>
+      <span class="tiny">Modell: <code class="small">./tfjs_model/model.json</code></span>
+      <span class="tiny" id="status"></span>
+    </div>
+
+    <div id="result" class="result"></div>
+
+    <details>
+      <summary>🧪 Debug</summary>
+      <pre id="debug"></pre>
+    </details>
+  </div>
+
+<script>
+  const BUILD = "20260118131357";
+  const BASE = new URL('.', window.location.href);
+  const MODEL_URL = new URL(`tfjs_model/model.json?v=${BUILD}`, BASE).toString();
+  const TOKENIZER_URL = new URL(`tfjs_model/tokenizer.json?v=${BUILD}`, BASE).toString();
+  function weightUrlConverter(url) {
+    return url.includes("?") ? `${url}&v=${BUILD}` : `${url}?v=${BUILD}`;
+  }
+
+  let model = null;
+  let tok = null;
+
+  const els = {
+    alert: document.getElementById('alert'),
+    ok: document.getElementById('ok'),
+    text: document.getElementById('text'),
+    result: document.getElementById('result'),
+    debug: document.getElementById('debug'),
+    status: document.getElementById('status'),
+  };
+
+  function log(x) { els.debug.textContent += x + "\n"; }
+  function setStatus(s) { els.status.textContent = s ? `Status: ${s}` : ""; }
+  function showError(msg) {
+    els.alert.style.display = 'block'; els.ok.style.display = 'none';
+    els.alert.textContent = '✖ Fel: ' + msg;
+  }
+  function showOk(msg) {
+    els.ok.style.display = 'block'; els.alert.style.display = 'none';
+    els.ok.textContent = '✔ ' + msg;
+  }
+  function clearMessages() {
+    els.alert.style.display = 'none'; els.ok.style.display = 'none';
+    els.alert.textContent = ''; els.ok.textContent = '';
+  }
+
+  function normalizeText(s) {
+    return (s || '')
+      .toLowerCase()
+      .replace(/[^a-zåäö0-9\s]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Bag-of-words: skapa en float32-vektor med längd max_length (N)
+  function vectorizeBow(text) {
+    const N = tok.max_length;
+    const v = new Float32Array(N);
+    const wi = tok.word_index || {};
+    const words = normalizeText(text).split(' ').filter(Boolean);
+    for (const w of words) {
+      const idx = wi[w];
+      if (idx != null && idx >= 1 && idx <= N) {
+        v[idx - 1] += 1.0;
+      }
+    }
+    // enkel normalisering (valfritt)
+    const sum = v.reduce((a,b)=>a+b, 0);
+    if (sum > 0) {
+      for (let i=0;i<N;i++) v[i] = v[i] / sum;
+    }
+    return v;
+  }
+
+  function argmax(arr) {
+    let best = 0;
+    for (let i=1;i<arr.length;i++) if (arr[i] > arr[best]) best = i;
+    return best;
+  }
+
+  async function loadAll() {
+    clearMessages();
+    els.debug.textContent = '';
+    setStatus("Laddar...");
+
+    try {
+      log("TFJS: " + (tf?.version?.tfjs ?? "okänd"));
+      log("MODEL_URL: " + MODEL_URL);
+
+      const rTok = await fetch(TOKENIZER_URL, { cache:"no-store" });
+      log("tokenizer status: " + rTok.status);
+      if (!rTok.ok) throw new Error("Kunde inte hämta tokenizer.json (" + rTok.status + ")");
+      tok = await rTok.json();
+
+      await tf.setBackend('webgl');
+      await tf.ready();
+
+      model = await tf.loadLayersModel(MODEL_URL, { weightUrlConverter });
+      setStatus("Modell laddad ✅");
+      showOk("Modellen är laddad ✅ (enkel BoW-demo)");
+      log("Input shape: " + JSON.stringify(model.inputs[0].shape));
+    } catch (e) {
+      console.error(e);
+      model = null; tok = null;
+      setStatus("Modell ej laddad ❌");
+      showError(e?.message || String(e));
+      log("ERROR: " + (e?.message || String(e)));
+    }
+  }
+
+  async function reloadModel() {
+    try { if (model?.dispose) model.dispose(); } catch {}
+    model = null; tok = null;
+    await loadAll();
+  }
+
+  async function analyze() {
+    clearMessages();
+    els.result.style.display = 'none';
+
+    const text = els.text.value.trim();
+    if (!text) return showError("Skriv ett omdöme först.");
+    if (!model || !tok) return showError("Modellen är inte laddad. Klicka “Ladda om modellen”.");
+
+    try {
+      const v = vectorizeBow(text);
+      const x = tf.tensor2d(v, [1, v.length], 'float32');
+      const y = model.predict(x);
+      const data = await y.data();
+
+      x.dispose();
+      if (y?.dispose) y.dispose();
+
+      const scores = Array.from(data);
+      const k = argmax(scores);
+      const label = tok.classes?.[k] ?? ["Negativ","Neutral","Positiv"][k] ?? ("Klass " + k);
+
+      els.result.style.display = 'block';
+      els.result.innerHTML =
+        `<strong>Resultat: ${label}</strong>
+         <div style="margin-top:8px;color:#374151;">
+           Scores: ${scores.map(s=>Number(s).toFixed(4)).join(', ')}
+         </div>`;
+    } catch (e) {
+      console.error(e);
+      showError(e?.message || String(e));
+      log("PREDICT ERROR: " + (e?.message || String(e)));
+    }
+  }
+
+  window.addEventListener('load', () => loadAll());
+</script>
+</body>
+
+</html>
